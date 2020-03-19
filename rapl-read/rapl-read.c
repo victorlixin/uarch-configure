@@ -21,7 +21,7 @@
 /* the sysfs powercap interface got into the kernel in 			*/
 /*	2d281d8196e38dd (3.13)						*/
 /*									*/
-/* Compile with:   gcc -O2 -Wall -o rapl-read rapl-read.c -lm		*/
+/* Compile with:   gcc --static -O2 -Wall -o rapl-read rapl-read.c -lm  */
 /*									*/
 /* Vince Weaver -- vincent.weaver @ maine.edu -- 11 September 2015	*/
 /*									*/
@@ -36,6 +36,7 @@
 #include <unistd.h>
 #include <math.h>
 #include <string.h>
+#include <signal.h>
 
 #include <sys/syscall.h>
 #include <linux/perf_event.h>
@@ -785,7 +786,9 @@ static int rapl_perf(int core) {
 	return 0;
 }
 
-static int rapl_sysfs(int core) {
+static int done;
+
+static int rapl_sysfs(int core, int sample_interval_us) {
 
 	char event_names[MAX_PACKAGES][NUM_RAPL_DOMAINS][256];
 	char filenames[MAX_PACKAGES][NUM_RAPL_DOMAINS][256];
@@ -854,38 +857,70 @@ static int rapl_sysfs(int core) {
 		}
 	}
 
-	printf("\tSleeping 1 second\n\n");
-	sleep(1);
+	long long loop = 0;
+	long long total_energy[MAX_PACKAGES][NUM_RAPL_DOMAINS] = {0};
+	long long delta;
 
-	/* Gather after values */
-	for(j=0;j<total_packages;j++) {
-		for(i=0;i<NUM_RAPL_DOMAINS;i++) {
-			if (valid[j][i]) {
-				fff=fopen(filenames[j][i],"r");
-				if (fff==NULL) {
-					fprintf(stderr,"\tError opening %s!\n",filenames[j][i]);
-				}
-				else {
-					fscanf(fff,"%lld",&after[j][i]);
-					fclose(fff);
+	while (!done) {
+		loop ++;
+		usleep(sample_interval_us);
+
+		/* Gather after values */
+		for(j=0;j<total_packages;j++) {
+			for(i=0;i<NUM_RAPL_DOMAINS;i++) {
+				if (valid[j][i]) {
+					fff=fopen(filenames[j][i],"r");
+					if (fff==NULL) {
+						fprintf(stderr,"\tError opening %s!\n",filenames[j][i]);
+					}
+					else {
+						fscanf(fff,"%lld",&after[j][i]);
+						fclose(fff);
+					}
 				}
 			}
 		}
-	}
 
+		for(j=0;j<total_packages;j++) {
+			printf("\tPackage %d\n",j);
+			for(i=0;i<NUM_RAPL_DOMAINS;i++) {
+				delta = after[j][i]-before[j][i];
+				total_energy[j][i] += delta;
+				before[j][i] = after[j][i];
+
+				if (valid[j][i]) {
+					printf("\t\t%s\t: %lfJ\n",event_names[j][i],
+						((double)delta)/1000000.0);
+				}
+			}
+		}
+		printf("\n");
+	} // while (!done)
+
+	// print total energy
+	printf("\n----------------------------\n");
+	printf("total_energy:\n");
+	printf("time duration: %lld(ms)\n", loop * (sample_interval_us / 1000));
 	for(j=0;j<total_packages;j++) {
 		printf("\tPackage %d\n",j);
 		for(i=0;i<NUM_RAPL_DOMAINS;i++) {
+			delta = total_energy[j][i];
 			if (valid[j][i]) {
 				printf("\t\t%s\t: %lfJ\n",event_names[j][i],
-					((double)after[j][i]-(double)before[j][i])/1000000.0);
+					((double)delta)/1000000.0);
 			}
 		}
 	}
-	printf("\n");
+	printf("----------------------------\n");
+
 
 	return 0;
 
+}
+
+static void sig_handler(int sig)
+{
+	done = 1;
 }
 
 int main(int argc, char **argv) {
@@ -900,15 +935,21 @@ int main(int argc, char **argv) {
 	printf("RAPL read -- use -s for sysfs, -p for perf_event, -m for msr\n\n");
 
 	opterr=0;
+	int sample_interval_us = 100000; // 100ms
 
-	while ((c = getopt (argc, argv, "c:hmps")) != -1) {
+	while ((c = getopt (argc, argv, "t:c:hmps")) != -1) {
 		switch (c) {
+		case 't':
+			sample_interval_us = atoi(optarg);
+			sample_interval_us *= 1000;
+			break;
 		case 'c':
 			core = atoi(optarg);
 			break;
 		case 'h':
 			printf("Usage: %s [-c core] [-h] [-m]\n\n",argv[0]);
-			printf("\t-c core : specifies which core to measure\n");
+			//printf("\t-c core : specifies which core to measure\n");
+			printf("\t-t      : sample inteval in ms\n");
 			printf("\t-h      : displays this help\n");
 			printf("\t-m      : forces use of MSR mode\n");
 			printf("\t-p      : forces use of perf_event mode\n");
@@ -933,6 +974,21 @@ int main(int argc, char **argv) {
 
 	cpu_model=detect_cpu();
 	detect_packages();
+#if 1
+	signal(SIGINT, sig_handler);
+	result=rapl_sysfs(core, sample_interval_us);
+	if (result<0) {
+		printf("Unable to read RAPL counters.\n");
+		printf("* Verify you have an Intel Sandybridge or newer processor\n");
+		printf("* You may need to run as root or have /proc/sys/kernel/perf_event_paranoid set properly\n");
+		printf("* If using raw msr access, make sure msr module is installed\n");
+		printf("\n");
+
+		return -1;
+
+	}
+
+#else
 
 	if ((!force_msr) && (!force_perf_event)) {
 		result=rapl_sysfs(core);
@@ -959,6 +1015,6 @@ int main(int argc, char **argv) {
 		return -1;
 
 	}
-
+#endif
 	return 0;
 }
